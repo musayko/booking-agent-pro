@@ -316,7 +316,7 @@ const handler: Handler = async (event) => {
     }));
 
     // Call Gemini API with function calling
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`;
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
 
     let finalReply = "";
     let toolCallsLog: any[] = [];
