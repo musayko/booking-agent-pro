@@ -65,31 +65,23 @@ async function checkAvailability(args: { date: string; service_id?: string }) {
   const { date, service_id } = args;
   const dayOfWeek = new Date(date + "T00:00:00").getDay();
 
-  // Business hours: Mon-Fri 9-18, Sat 10-14, Sun closed
   if (dayOfWeek === 0) return { available: false, message: "The clinic is closed on Sundays.", slots: [] };
 
   const startHour = dayOfWeek === 6 ? 10 : 9;
   const endHour = dayOfWeek === 6 ? 14 : 18;
 
-  // Get service duration
   let duration = 30;
   if (service_id && supabase) {
     const { data: svc } = await supabase.from("services").select("duration_minutes").eq("id", service_id).maybeSingle();
     if (svc) duration = svc.duration_minutes;
   }
 
-  // Get existing bookings for this date
   let existingBookings: any[] = [];
   if (supabase) {
-    const { data } = await supabase
-      .from("bookings")
-      .select("start_time, end_time")
-      .eq("booking_date", date)
-      .neq("status", "cancelled");
+    const { data } = await supabase.from("bookings").select("start_time, end_time").eq("booking_date", date).neq("status", "cancelled");
     existingBookings = data || [];
   }
 
-  // Generate available slots
   const slots: string[] = [];
   for (let h = startHour; h < endHour; h++) {
     for (let m = 0; m < 60; m += 30) {
@@ -98,9 +90,6 @@ async function checkAvailability(args: { date: string; service_id?: string }) {
       if (endMin > endHour * 60) continue;
 
       const startStr = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
-      const endStr = `${String(Math.floor(endMin / 60)).padStart(2, "0")}:${String(endMin % 60).padStart(2, "0")}`;
-
-      // Check for overlap with existing bookings
       const hasOverlap = existingBookings.some(b => {
         const bStart = timeToMinutes(b.start_time);
         const bEnd = timeToMinutes(b.end_time);
@@ -126,7 +115,6 @@ async function createBooking(args: {
   customer_name: string; customer_email: string;
   customer_phone?: string; date: string; time: string;
 }) {
-  // Get service duration
   let duration = 30;
   if (supabase) {
     const { data: svc } = await supabase.from("services").select("duration_minutes").eq("id", args.service_id).maybeSingle();
@@ -137,22 +125,17 @@ async function createBooking(args: {
   const endMin = startMin + duration;
   const endTime = `${String(Math.floor(endMin / 60)).padStart(2, "0")}:${String(endMin % 60).padStart(2, "0")}`;
 
-  // Double-booking check
   if (supabase) {
     const { data: conflicts } = await supabase
-      .from("bookings")
-      .select("id")
-      .eq("booking_date", args.date)
-      .neq("status", "cancelled")
-      .lt("start_time", endTime)
-      .gt("end_time", args.time);
+      .from("bookings").select("id")
+      .eq("booking_date", args.date).neq("status", "cancelled")
+      .lt("start_time", endTime).gt("end_time", args.time);
 
     if (conflicts?.length) {
       return { success: false, message: "This time slot is no longer available. Please choose another time." };
     }
   }
 
-  // Insert booking
   const booking = {
     service_id: args.service_id,
     service_name: args.service_name,
@@ -169,15 +152,14 @@ async function createBooking(args: {
   let bookingId = `local-${Date.now()}`;
   if (supabase) {
     const { data, error } = await supabase.from("bookings").insert(booking).select("id").single();
-    if (error) return { success: false, message: "Failed to create booking. Please try again." };
+    if (error) {
+      console.error("[Booking] Insert error:", error);
+      return { success: false, message: "Failed to create booking. Please try again." };
+    }
     bookingId = data.id;
   }
 
-  // Send confirmation email
-  await sendBookingEmail({
-    ...booking,
-    id: bookingId,
-  });
+  await sendBookingEmail({ ...booking, id: bookingId });
 
   return {
     success: true,
@@ -239,28 +221,22 @@ async function sendBookingEmail(booking: any) {
         <p style="color:#666;font-size:12px;margin-top:20px">BookingAgent Pro | ${TEAM_SLUG}</p>
       </div>`;
 
-    // Send to customer
     await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_API_KEY}` },
       body: JSON.stringify({
-        from: "onboarding@resend.dev",
-        to: booking.customer_email,
-        subject: `[BOOKING-2026] ${TEAM_SLUG} - Appointment Confirmed`,
-        html,
+        from: "onboarding@resend.dev", to: booking.customer_email,
+        subject: `[BOOKING-2026] ${TEAM_SLUG} - Appointment Confirmed`, html,
       }),
     });
 
-    // Send to owner
     if (NOTIFICATION_EMAIL) {
       await fetch("https://api.resend.com/emails", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_API_KEY}` },
         body: JSON.stringify({
-          from: "onboarding@resend.dev",
-          to: NOTIFICATION_EMAIL,
-          subject: `[BOOKING-2026] ${TEAM_SLUG} - New Booking: ${booking.customer_name}`,
-          html,
+          from: "onboarding@resend.dev", to: NOTIFICATION_EMAIL,
+          subject: `[BOOKING-2026] ${TEAM_SLUG} - New Booking: ${booking.customer_name}`, html,
         }),
       });
     }
@@ -292,52 +268,49 @@ const handler: Handler = async (event) => {
     let systemPrompt = "";
     let agentMode = "full_booking";
     if (supabase) {
-      const { data } = await supabase.from("agent_settings").select("*").maybeSingle();
-      if (data) {
-        systemPrompt = data.system_prompt;
-        agentMode = data.mode;
-      }
+      try {
+        const { data } = await supabase.from("agent_settings").select("*").maybeSingle();
+        if (data) { systemPrompt = data.system_prompt; agentMode = data.mode; }
+      } catch (_e) { /* use defaults */ }
     }
     if (!systemPrompt) {
       systemPrompt = `You are a friendly dental receptionist for SmilePro Dental. Help customers book appointments, check availability, and answer questions. Business hours: Mon-Fri 9:00-18:00, Sat 10:00-14:00, Sun closed. Address: Pärnu mnt 25, Tallinn.`;
     }
 
-    if (language === "et") {
-      systemPrompt += "\n\nThe customer is speaking Estonian. Respond in Estonian.";
-    }
-    if (agentMode === "info_only") {
-      systemPrompt += "\n\nIMPORTANT: You are in Information Only mode. Do NOT book appointments. Only provide information and suggest the customer call to book.";
-    }
+    if (language === "et") systemPrompt += "\n\nThe customer is speaking Estonian. Respond in Estonian.";
+    if (agentMode === "info_only") systemPrompt += "\n\nIMPORTANT: You are in Information Only mode. Do NOT book appointments. Only provide information and suggest the customer call to book.";
 
-    // Build Gemini request
     const geminiMessages = messages.map((m: any) => ({
       role: m.role === "assistant" ? "model" : "user",
       parts: [{ text: m.content }],
     }));
 
-    // Call Gemini API with function calling
     const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
 
     let finalReply = "";
     let toolCallsLog: any[] = [];
     let attempts = 0;
-    const maxAttempts = 5; // Allow multiple tool call rounds
 
     let currentContents = [
       { role: "user", parts: [{ text: systemPrompt }] },
-      { role: "model", parts: [{ text: "Understood. I am the SmilePro Dental assistant. I will help customers with appointments and information." }] },
+      { role: "model", parts: [{ text: "Understood. I am the SmilePro Dental assistant." }] },
       ...geminiMessages,
     ];
 
-    while (attempts < maxAttempts) {
+    while (attempts < 5) {
       attempts++;
 
       const geminiBody: any = {
         contents: currentContents,
         tools: agentMode === "info_only"
-          ? [{ functionDeclarations: [tools[0].functionDeclarations[2]] }] // Only get_business_info
+          ? [{ functionDeclarations: [tools[0].functionDeclarations[2]] }]
           : tools,
+        generationConfig: {
+          thinking: { thinkingBudget: 0 },
+        },
       };
+
+      console.log(`[Chat] Attempt ${attempts}`);
 
       const geminiRes = await fetch(geminiUrl, {
         method: "POST",
@@ -347,7 +320,7 @@ const handler: Handler = async (event) => {
 
       if (!geminiRes.ok) {
         const errText = await geminiRes.text();
-        console.error("Gemini API error:", errText);
+        console.error("[Chat] Gemini error:", geminiRes.status, errText.substring(0, 300));
         finalReply = "I'm having trouble connecting right now. Please try again in a moment.";
         break;
       }
@@ -356,46 +329,40 @@ const handler: Handler = async (event) => {
       const candidate = geminiData.candidates?.[0];
       const parts = candidate?.content?.parts || [];
 
-      // Check for function calls
+      console.log("[Chat] Parts count:", parts.length, "types:", parts.map((p: any) => Object.keys(p).join(",")).join(" | "));
+
       const functionCalls = parts.filter((p: any) => p.functionCall);
       const textParts = parts.filter((p: any) => p.text);
 
       if (functionCalls.length > 0) {
-        // Execute each function call
+        console.log("[Chat] Function calls:", functionCalls.map((fc: any) => fc.functionCall.name));
+
         const functionResponses: any[] = [];
         for (const fc of functionCalls) {
           const { name, args } = fc.functionCall;
           let result: any;
-
-          switch (name) {
-            case "check_availability":
-              result = await checkAvailability(args);
-              break;
-            case "create_booking":
-              result = await createBooking(args);
-              break;
-            case "get_business_info":
-              result = await getBusinessInfo(args);
-              break;
-            default:
-              result = { error: "Unknown function" };
+          try {
+            switch (name) {
+              case "check_availability": result = await checkAvailability(args); break;
+              case "create_booking": result = await createBooking(args); break;
+              case "get_business_info": result = await getBusinessInfo(args); break;
+              default: result = { error: "Unknown function" };
+            }
+          } catch (toolErr: any) {
+            console.error(`[Chat] Tool error ${name}:`, toolErr.message);
+            result = { error: toolErr.message };
           }
 
           toolCallsLog.push({ name, args, result });
-          functionResponses.push({
-            functionResponse: { name, response: result },
-          });
+          functionResponses.push({ functionResponse: { name, response: result } });
         }
 
-        // Add model's response and function results to conversation
         currentContents.push({ role: "model", parts: functionCalls.map((fc: any) => ({ functionCall: fc.functionCall })) });
         currentContents.push({ role: "user", parts: functionResponses });
-
-        // Continue loop to let Gemini process the function results
         continue;
       }
 
-      // No more function calls — extract text reply
+      // Extract text (skip thinking parts)
       if (textParts.length > 0) {
         finalReply = textParts.map((p: any) => p.text).join("\n");
       } else {
@@ -406,20 +373,12 @@ const handler: Handler = async (event) => {
 
     // Save chat history
     if (supabase && sessionId) {
-      const historyEntries = [
-        ...messages.map((m: any) => ({
-          session_id: sessionId,
-          role: m.role,
-          content: m.content,
-        })),
-        {
-          session_id: sessionId,
-          role: "assistant",
-          content: finalReply,
-          tool_calls: toolCallsLog.length > 0 ? toolCallsLog : null,
-        },
-      ];
-      await supabase.from("chat_history").insert(historyEntries).then(() => {});
+      try {
+        await supabase.from("chat_history").insert([
+          ...messages.map((m: any) => ({ session_id: sessionId, role: m.role, content: m.content })),
+          { session_id: sessionId, role: "assistant", content: finalReply, tool_calls: toolCallsLog.length > 0 ? toolCallsLog : null },
+        ]);
+      } catch (_e) { /* non-critical */ }
     }
 
     return {
@@ -428,12 +387,8 @@ const handler: Handler = async (event) => {
       body: JSON.stringify({ reply: finalReply }),
     };
   } catch (err: any) {
-    console.error("Chat handler error:", err);
-    return {
-      statusCode: 500,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reply: "Something went wrong. Please try again." }),
-    };
+    console.error("[Chat] Error:", err.message);
+    return { statusCode: 500, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reply: "Something went wrong. Please try again." }) };
   }
 };
 
