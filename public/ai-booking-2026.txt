@@ -1,0 +1,72 @@
+BookingAgent Pro — AI Appointment Management System
+====================================================
+
+Student Name: Musa Ozdemir
+Team Slug: bookingpro-musa
+Live URL: https://bookingpro-musa.netlify.app
+Repository URL: https://github.com/musayko/booking-agent-pro
+
+Stack Used:
+- Frontend: React 18 + TypeScript + Vite
+- Styling: Tailwind CSS v4
+- Database: Supabase (PostgreSQL + Auth + RLS)
+- AI Engine: Google Gemini 2.0 Flash (Function Calling)
+- Email: Resend API
+- Hosting: Netlify (with serverless functions)
+- i18n: Custom React context (EN/ET)
+
+Business Niche: Premium Dental Clinic (SmilePro Dental)
+
+Function Calling Implementation (Technical Explanation):
+=========================================================
+
+The AI chat engine uses Google Gemini's Function Calling (Tools) feature
+to bridge natural language conversations with database operations.
+
+Architecture:
+1. User sends message → Chat Widget → Netlify Function (/api/chat)
+2. Netlify Function loads agent_settings (system prompt, mode) from Supabase
+3. Function calls Gemini API with:
+   - System prompt as first message
+   - Conversation history
+   - Tool definitions (3 functions)
+4. Gemini decides whether to call a tool or respond directly
+5. If tool call → Function executes against Supabase → Returns result to Gemini
+6. Gemini formulates a natural language response using tool results
+7. Response sent back to Chat Widget
+
+Three Tools Defined:
+
+Tool 1: check_availability(date, service_id?)
+- Queries bookings table for the given date
+- Calculates business hours (Mon-Fri 9-18, Sat 10-14)
+- Generates 30-minute time slots
+- Checks each slot against existing bookings for overlap
+- Returns list of available times
+
+Tool 2: create_booking(service_id, customer_name, customer_email, date, time)
+- Validates no double-booking (OVERLAPS check)
+- Calculates end_time from service duration
+- Inserts row into bookings table
+- Triggers Resend email to customer AND owner
+- Returns confirmation with booking ID
+
+Tool 3: get_business_info(question_type)
+- Queries agent_settings and services tables
+- Returns relevant info based on question type (services/hours/faq/general)
+
+Anti-Double-Booking Logic:
+- Before INSERT, queries: WHERE booking_date = $date AND status != 'cancelled'
+  AND start_time < $end_time AND end_time > $start_time
+- If overlap found, rejects booking and suggests alternative
+
+Multi-Turn Tool Calling:
+- The function supports up to 5 rounds of tool calls per request
+- Gemini can call multiple tools sequentially (e.g., check availability → book)
+
+All chat interactions are saved to chat_history table for audit purposes.
+Email subjects follow format: [BOOKING-2026] bookingpro-musa - <description>
+
+Dashboard Credentials:
+Email: admin@bookingpro.cms
+Password: demo2026
