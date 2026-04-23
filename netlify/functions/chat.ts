@@ -305,9 +305,6 @@ const handler: Handler = async (event) => {
         tools: agentMode === "info_only"
           ? [{ functionDeclarations: [tools[0].functionDeclarations[2]] }]
           : tools,
-        generationConfig: {
-          thinking: { thinkingBudget: 0 },
-        },
       };
 
       console.log(`[Chat] Attempt ${attempts}`);
