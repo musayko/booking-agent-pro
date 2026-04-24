@@ -251,18 +251,149 @@ function timeToMinutes(time: string): number {
   return h * 60 + m;
 }
 
+// ─── Rate Limiting ───
+
+const ALLOWED_ORIGINS = [
+  "https://bookingpro-musa.netlify.app",
+  "http://localhost:5173",  // local dev
+  "http://localhost:8888",  // netlify dev
+];
+
+const MAX_REQUESTS_PER_IP_PER_HOUR = 20;    // Max 20 chats per IP per hour
+const MAX_REQUESTS_PER_SESSION = 30;         // Max 30 messages per session total
+const MAX_DAILY_API_CALLS = 200;             // Global daily budget cap
+const MAX_MESSAGE_LENGTH = 500;              // Max chars per user message
+const MAX_MESSAGES_PER_REQUEST = 20;         // Max conversation history length
+
+// In-memory rate limit store (resets on cold start, backed by Supabase)
+const ipRateMap = new Map<string, { count: number; resetAt: number }>();
+
+function checkIpRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = ipRateMap.get(ip);
+
+  if (!entry || now > entry.resetAt) {
+    ipRateMap.set(ip, { count: 1, resetAt: now + 3600_000 }); // 1 hour window
+    return true;
+  }
+
+  if (entry.count >= MAX_REQUESTS_PER_IP_PER_HOUR) return false;
+  entry.count++;
+  return true;
+}
+
+async function checkDailyBudget(): Promise<boolean> {
+  if (!supabase) return true;
+  try {
+    const today = new Date().toISOString().split("T")[0];
+    const { count } = await supabase
+      .from("chat_history")
+      .select("*", { count: "exact", head: true })
+      .eq("role", "assistant")
+      .gte("created_at", `${today}T00:00:00Z`);
+    return (count || 0) < MAX_DAILY_API_CALLS;
+  } catch {
+    return true; // fail open if DB check fails
+  }
+}
+
+async function checkSessionLimit(sessionId: string): Promise<boolean> {
+  if (!supabase || !sessionId) return true;
+  try {
+    const { count } = await supabase
+      .from("chat_history")
+      .select("*", { count: "exact", head: true })
+      .eq("session_id", sessionId);
+    return (count || 0) < MAX_REQUESTS_PER_SESSION;
+  } catch {
+    return true;
+  }
+}
+
+function getCorsHeaders(origin?: string) {
+  const allowed = ALLOWED_ORIGINS.includes(origin || "");
+  return {
+    "Access-Control-Allow-Origin": allowed ? origin! : ALLOWED_ORIGINS[0],
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Content-Type": "application/json",
+  };
+}
+
 // ─── Main Handler ───
 
 const handler: Handler = async (event) => {
+  const origin = event.headers?.origin || event.headers?.Origin || "";
+  const corsHeaders = getCorsHeaders(origin);
+
   if (event.httpMethod === "OPTIONS") {
-    return { statusCode: 200, headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "Content-Type" }, body: "" };
+    return { statusCode: 200, headers: corsHeaders, body: "" };
   }
   if (event.httpMethod !== "POST") {
-    return { statusCode: 405, body: "Method not allowed" };
+    return { statusCode: 405, headers: corsHeaders, body: JSON.stringify({ reply: "Method not allowed" }) };
+  }
+
+  // ── Security Layer 1: Origin check ──
+  if (origin && !ALLOWED_ORIGINS.includes(origin)) {
+    console.warn(`[Security] Blocked origin: ${origin}`);
+    return { statusCode: 403, headers: corsHeaders, body: JSON.stringify({ reply: "Access denied." }) };
+  }
+
+  // ── Security Layer 2: IP rate limit ──
+  const clientIp = event.headers?.["x-forwarded-for"]?.split(",")[0]?.trim()
+    || event.headers?.["client-ip"]
+    || "unknown";
+
+  if (!checkIpRateLimit(clientIp)) {
+    console.warn(`[Security] Rate limited IP: ${clientIp}`);
+    return {
+      statusCode: 429,
+      headers: { ...corsHeaders, "Retry-After": "300" },
+      body: JSON.stringify({ reply: "Too many requests. Please try again in a few minutes." }),
+    };
+  }
+
+  // ── Security Layer 3: Daily budget cap ──
+  if (!(await checkDailyBudget())) {
+    console.warn("[Security] Daily API budget exhausted");
+    return {
+      statusCode: 429,
+      headers: corsHeaders,
+      body: JSON.stringify({ reply: "The assistant is temporarily unavailable. Please try again tomorrow or call us at +372 5555 1234." }),
+    };
   }
 
   try {
-    const { messages, sessionId, language } = JSON.parse(event.body || "{}");
+    const body = JSON.parse(event.body || "{}");
+    const { messages, sessionId, language } = body;
+
+    // ── Security Layer 4: Input validation ──
+    if (!messages || !Array.isArray(messages) || messages.length === 0) {
+      return { statusCode: 400, headers: corsHeaders, body: JSON.stringify({ reply: "Invalid request." }) };
+    }
+
+    if (messages.length > MAX_MESSAGES_PER_REQUEST) {
+      return { statusCode: 400, headers: corsHeaders, body: JSON.stringify({ reply: "Conversation too long. Please start a new chat." }) };
+    }
+
+    // Validate and sanitize each message
+    for (const msg of messages) {
+      if (!msg.content || typeof msg.content !== "string") {
+        return { statusCode: 400, headers: corsHeaders, body: JSON.stringify({ reply: "Invalid message format." }) };
+      }
+      if (msg.content.length > MAX_MESSAGE_LENGTH) {
+        return { statusCode: 400, headers: corsHeaders, body: JSON.stringify({ reply: `Messages must be under ${MAX_MESSAGE_LENGTH} characters.` }) };
+      }
+    }
+
+    // ── Security Layer 5: Session limit ──
+    if (!(await checkSessionLimit(sessionId))) {
+      return {
+        statusCode: 429,
+        headers: corsHeaders,
+        body: JSON.stringify({ reply: "This chat session has reached its limit. Please start a new conversation or call us at +372 5555 1234." }),
+      };
+    }
 
     // Load agent settings
     let systemPrompt = "";
@@ -380,12 +511,12 @@ const handler: Handler = async (event) => {
 
     return {
       statusCode: 200,
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      headers: corsHeaders,
       body: JSON.stringify({ reply: finalReply }),
     };
   } catch (err: any) {
     console.error("[Chat] Error:", err.message);
-    return { statusCode: 500, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reply: "Something went wrong. Please try again." }) };
+    return { statusCode: 500, headers: corsHeaders, body: JSON.stringify({ reply: "Something went wrong. Please try again." }) };
   }
 };
 
